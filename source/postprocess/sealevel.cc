@@ -33,14 +33,8 @@
 #include <limits>
 
 // TODO:
-// Get geoid postprocessor to work with a free surface
-// Obtain geoid anomaly of model from the geoid postprocessor
-// Obtain geoid anomaly of surface load (from new postprocessor, from geoid postprocessor when implemented in there, or compute here)
-// Load an ascii file with the initial ocean basin (equal for all time steps, fixed ocean basin for now)
-// Compute ice mass change: follows from ice input data (does not change over iterations)
-// Compute the sea level change (from ice mass change, surface displacement, change in gravitational potential from model and ice load)
+// Obtain geoid anomaly of surface load
 // Compute new surface gravity, dependent on surface topography and Earth model
-// Make new ocean loading parameter: sea level * sea water density * new surface gravity
 
 namespace aspect
 {
@@ -50,45 +44,44 @@ namespace aspect
     void
     SeaLevel<dim>::initialize()
     {
-      topography_lookup = std::make_unique<Utilities::StructuredDataLookup<2>>(1,1.0);
-      topography_lookup->load_file(data_directory+topography_file_name,
-                                 this->get_mpi_communicator());
+      topography_lookup = std::make_unique<Utilities::StructuredDataLookup<dim-1>>(1,1.0);
+      topography_lookup->load_file(data_directory_topography+data_file_name_topography,this->get_mpi_communicator());
+
+      iceload_lookup = std::make_unique<Utilities::StructuredDataLookup<dim-1>>(1,1.0);
+      iceload_lookup->load_file(data_directory_iceload+data_file_name_iceload,this->get_mpi_communicator());
     }
 
 
     template <int dim>
     double
-    SeaLevel<dim>::sea_level_equation(double nonuniform_sealevelchange,double sealevel_offset)
+    SeaLevel<dim>::calculate_nonuniform_sealevel_change(const Point<dim> &position)
     {
-      double sea_level = nonuniform_sealevelchange+sealevel_offset;
-      return sea_level;
-    }
-
-
-    template <int dim>
-    double
-    SeaLevel<dim>::calculate_nonuniform_sealevelchange(const Point<dim> &position) // position: x,y,z
-    {
-      const double geoid_displacement = Geoid<3>::evaluate(position); // check sign  
+      const double geoid_displacement = Geoid<dim>::evaluate(position); // (check sign of geoid_displacement)  
       const double elevation = this->get_geometry_model().height_above_reference_surface(position);
       
-      point<2> position
-      position[0] = longitude
-      position[1] = 
+      Point<dim-1> internal_position;
+      const std::array<double,dim> spherical_position = aspect::Utilities::Coordinates::cartesian_to_spherical_coordinates(position);
+      for (unsigned int d = 1; d < dim; ++d)
+        internal_position[d-1] = spherical_position[d];
 
-      nonuniform_sealevelchange = (geoid_displacement-elevation)*ocean_mask
+      topography = topography_lookup->get_data(internal_position,0);
+      if (topography > 0.0)
+        const double ocean_mask = 1;
+      else
+        const double ocean_mask = 0;
+      
+      nonuniform_sealevel = (geoid_displacement-elevation)*ocean_mask;
 
-      return nonuniform_sealevelchange;
+      return nonuniform_sealevel_change;
     }
 
 
     template <int dim>
     double
-    SeaLevel<dim>::calculate_sealevel_offset(const double &outer_radius,
-                                             const double &inner_radius) const
+    SeaLevel<dim>::calculate_sealevel_offset(const double &outer_radius) const
     {
       const unsigned int quadrature_degree = this->introspection().polynomial_degree.temperature;
-      const QGauss<2> quadrature_formula_face(quadrature_degree); // need to grab the infinitesimal area of each quadrature points on every boundary face here
+      const QGauss<2> quadrature_formula_face(quadrature_degree);
 
       FEFaceValues<3> fe_face_values (this->get_mapping(),
                                       this->get_fe(),
@@ -97,25 +90,24 @@ namespace aspect
                                       update_quadrature_points |
                                       update_JxW_values);
 
-      std::vector<double> topo_values( quadrature_formula_face.size());
 
-      // vectors to store the location, infinitesimal area, and topography and geoid displacement associated with each quadrature point of each surface cell.
+      // Vectors to store the location, infinitesimal area, and topography/geoid displacement/ocean mask/ice load associated with each quadrature point of each surface cell.
       std::vector<std::pair<Point<3>,std::pair<double,double>>> topo_stored_values;
       std::vector<std::pair<Point<3>,std::pair<double,double>>> geoid_stored_values;
+      std::vector<std::pair<Point<3>,std::pair<double,double>>> oceanmask_stored_values;
+      std::vector<std::pair<Point<3>,std::pair<double,double>>> iceload_stored_values;
 
-      // loop over all of the boundary cells and if one is at
-      // surface, evaluate the topography and geoid displacement there.
+      // Loop over all of the boundary cells and if one is at the
+      // surface, evaluate the topography/geoid displacement/ocean mask/ice load there.
       for (const auto &cell : this->get_dof_handler().active_cell_iterators())
         if (cell->is_locally_owned() && cell->at_boundary())
           {
-            // see if the cell is at the top boundary, not just any boundary
             bool at_upper_surface = false;
             {
               for (unsigned int f=0; f<GeometryInfo<3>::faces_per_cell; ++f)
                 {
                   if (cell->at_boundary(f) && cell->face(f)->boundary_id() == this->get_geometry_model().translate_symbolic_boundary_name_to_id("top"))
                     {
-                      // If the cell is at the top boundary, assign face_idx.
                       at_upper_surface = true;
                       break;
                     }
@@ -123,15 +115,15 @@ namespace aspect
                     continue;
                 }
 
-              // if the cell is not at the top boundary, keep the search loop
+              // If the cell is not at the top boundary, jump to the next cell.
               if (at_upper_surface == false)
                 continue;
             }
 
-            // focus on the boundary cell's upper face if on the top boundary
+            // Focus on the boundary cell's upper face if on the top boundary.
             fe_face_values.reinit(cell);
 
-            // If the cell is at the top boundary, add its contributions to topography and geoid storage vectors
+            // If the cell is at the top boundary, add its contributions to the topography/geoid displacement/ocean mask/ice load storage vectors.
             if (at_upper_surface)
               {
                 for (unsigned int q=0; q<fe_face_values.n_quadrature_points; ++q)
@@ -139,55 +131,78 @@ namespace aspect
                     const Point<3> current_position = fe_face_values.quadrature_point(q);
                     const double topography = this->get_geometry_model().height_above_reference_surface(current_position);
                     topo_stored_values.emplace_back (current_position, std::make_pair(fe_face_values.JxW(q), topography));
-                    const double geoid = Geoid<3>::evaluate(current_position);
+                    const double geoid = Geoid<dim>::evaluate(current_position);
                     geoid_stored_values.emplace_back (fe_face_values.quadrature_point(q), std::make_pair(fe_face_values.JxW(q), geoid);
 
-                    //integrated_topography += topography*fe_face_values.JxW(q);
-                    //integrated_geoid += geoid*fe_face_values.JxW(q);
-                    //integrated_surface_area += fe_face_values.JxW(q);
+                    Point<dim-1> internal_position;
+                    const std::array<double,dim> spherical_position = aspect::Utilities::Coordinates::cartesian_to_spherical_coordinates(position);
+                    for (unsigned int d = 1; d < dim; ++d)
+                      internal_position[d-1] = spherical_position[d];
 
-                    // from ocean mask, retrieve interpolated ocean mask value (1 or 0)
-                    point<2> position
-                    position[0] = longitude
-                    position[1] = 
+                    topography = topography_lookup->get_data(internal_position,0);
+                    if (topography > 0.0)
+                      const double ocean_mask = 1;
+                    else
+                      const double ocean_mask = 0;
+                    oceanmask_stored_values.emplace_back (fe_face_values.quadrature_point(q), std::make_pair(fe_face_values.JxW(q), ocean_mask);
 
-                    const double integral_topo_geoid += (geoid-topography)*fe_face_values.JxW(q);
+                    ice_load = iceload_lookup->get_data(internal_position,0);
+                    iceload_stored_values.emplace_back (fe_face_values.quadrature_point(q), std::make_pair(fe_face_values.JxW(q), ice_load);
+                    
+                    // Compute required integrals for the sea level offset.
+                    const double integral_oceanmask += ocean_mask*fe_face_values.JxW(q);
+                    const double integral_iceload += iceload*density_ice*(1-ocean_mask)*fe_face_values.JxW(q);
+                    const double integral_topo_geoid += (geoid-topography)*ocean_mask*fe_face_values.JxW(q);
                   }
               }
           }
       
-      //const double average_topography = Utilities::MPI::sum (integrated_topography,this->get_mpi_communicator()) / Utilities::MPI::sum (integrated_surface_area,this->get_mpi_communicator());
-      //const double average_geoid = Utilities::MPI::sum (integrated_geoid,this->get_mpi_communicator()) / Utilities::MPI::sum (integrated_surface_area,this->get_mpi_communicator());
+      const double sealevel_offset = -1./integral_oceanmask*(1./density_water*integral_iceload+integral_topo_geoid);
 
       std::vector<std::vector<double>> topo_spherical_function;
       std::vector<std::vector<double>> geoid_spherical_function;
+      std::vector<std::vector<double>> oceanmask_spherical_function;
+      std::vector<std::vector<double>> iceload_spherical_function;
 
       for (unsigned int i=0; i<topo_stored_values.size(); ++i)
         {
           const std::array<double,3> scoord = aspect::Utilities::Coordinates::cartesian_to_spherical_coordinates(topo_stored_values[i].first);
 
-          // calculate spherical infinitesimal sin(theta)*d_theta*d_phi by infinitesimal_area/radius^2
+          // Calculate spherical infinitesimal sin(theta)*d_theta*d_phi by infinitesimal_area/radius^2
           const double infinitesimal = topo_stored_values[i].second.first/(outer_radius*outer_radius);
 
-          // theta, phi, spherical infinitesimal, and topography
+          // Theta, phi, spherical infinitesimal, and topography
           topo_spherical_function.emplace_back(std::vector<double> {scoord[2],
                                                                     scoord[1],
                                                                     infinitesimal,
                                                                     topo_stored_values[i].second.second
                                                                    });
           
-          // theta, phi, spherical infinitesimal, and geoid displacement  
+          // Theta, phi, spherical infinitesimal, and geoid displacement  
           geoid_spherical_function.emplace_back(std::vector<double> {scoord[2],
                                                                      scoord[1],
                                                                      infinitesimal,
                                                                      geoid_stored_values[i].second.second
                                                                     });
+
+          // Theta, phi, spherical infinitesimal, and ocean mask  
+          oceanmask_spherical_function.emplace_back(std::vector<double> {scoord[2],
+                                                                         scoord[1],
+                                                                         infinitesimal,
+                                                                         oceanmask_stored_values[i].second.second
+                                                                        });
+
+          // Theta, phi, spherical infinitesimal, and ice load  
+          iceload_spherical_function.emplace_back(std::vector<double> {scoord[2],
+                                                                       scoord[1],
+                                                                       infinitesimal,
+                                                                       iceload_stored_values[i].second.second
+                                                                      });
         }
-
-      //double ice_area_density_int = ; // from ice input ascii data. nice if also compatible with surface load function.
-
-
-      return sealevel_offset;
+      std::pair<const double, std::vector<double>> sealevel_offset_and_iceload
+        = std::make_pair(sealevel_offset,iceload_spherical_function);
+      
+      return sealevel_offset_and_iceload
     }
 
 
@@ -195,163 +210,248 @@ namespace aspect
     std::pair<std::string,std::string>
     SeaLevel<dim>::execute (TableHandler &statistics)
     {
-      //Disallow use of the plugin for any other than a 3D spherical shell geometry
+      // Disallow use of the plugin for any other than a 3D spherical shell geometry.
       AssertThrow (Plugins::plugin_type_matches<const GeometryModel::SphericalShell<dim>>(this->get_geometry_model())
                    &&
                    dim == 3,
                    ExcMessage("The sea level postprocessor is currently only implemented for the 3D spherical shell geometry model."));
 
+      const GeometryModel::SphericalShell<dim> &geometry_model = Plugins::get_plugin_as_type<const GeometryModel::SphericalShell<dim>> (this->get_geometry_model());
       const types::boundary_id relevant_boundary = this->get_geometry_model().translate_symbolic_boundary_name_to_id ("top");
 
-      // Get a quadrature rule that exists only on the corners
-      QTrapezoid<dim-1> face_corners;
-      FEFaceValues<dim> face_vals (this->get_mapping(), this->get_fe(), face_corners, update_quadrature_points);
+      // Get the value of the outer radius.
+      const double outer_radius = geometry_model.outer_radius();
+      
+      // Get the sea level offset (constant for every location).
+      sealevel_offset_and_iceload = calculate_sealevel_offset(outer_radius)
+      sealevel_offset = sealevel_offset_and_iceload.first
 
-      // have a stream into which we write the data. the text stream is then
-      // later sent to processor 0
-      std::ostringstream output_stats;
-      std::ostringstream output_file;
+      // Get the non-uniform sea level change (different for every location).
+      
+      const unsigned int quadrature_degree = this->introspection().polynomial_degree.temperature;
+      const QGauss<2> quadrature_formula_face(quadrature_degree);
 
-      // Choose stupidly large values for initialization
-      double local_max_height = -std::numeric_limits<double>::max();
-      double local_min_height = std::numeric_limits<double>::max();
+      FEFaceValues<3> fe_face_values (this->get_mapping(),
+                                      this->get_fe(),
+                                      quadrature_formula_face,
+                                      update_values |
+                                      update_quadrature_points |
+                                      update_JxW_values);
 
-      // loop over all of the surface cells and save the elevation to stored_value
+      // Vectors to store the location, infinitesimal area, and non-uniform sea level change associated with each quadrature point of each surface cell.
+      std::vector<std::pair<Point<3>,std::pair<double,double>>> nonuniform_sealevel_change_stored_values;
+
+      // Loop over all of the boundary cells and if one is at the
+      // surface, evaluate the non-uniform sea level change there.
       for (const auto &cell : this->get_dof_handler().active_cell_iterators())
         if (cell->is_locally_owned() && cell->at_boundary())
-          for (unsigned int face_no = 0; face_no < GeometryInfo<dim>::faces_per_cell; ++face_no)
-            if (cell->face(face_no)->at_boundary())
+          {
+            bool at_upper_surface = false;
+            {
+              for (unsigned int f=0; f<GeometryInfo<3>::faces_per_cell; ++f)
+                {
+                  if (cell->at_boundary(f) && cell->face(f)->boundary_id() == this->get_geometry_model().translate_symbolic_boundary_name_to_id("top"))
+                    {
+                      at_upper_surface = true;
+                      break;
+                    }
+                  else
+                    continue;
+                }
+
+              // If the cell is not at the top boundary, jump to the next cell.
+              if (at_upper_surface == false)
+                continue;
+            }
+
+            // Focus on the boundary cell's upper face if on the top boundary.
+            fe_face_values.reinit(cell);
+
+            // If the cell is at the top boundary, add its contributions to the non-uniform sea level change storage vectors.
+            if (at_upper_surface)
               {
-                if ( cell->face(face_no)->boundary_id() != relevant_boundary)
-                  continue;
-
-                face_vals.reinit( cell, face_no);
-
-                for (unsigned int corner = 0; corner < face_corners.size(); ++corner)
+                for (unsigned int q=0; q<fe_face_values.n_quadrature_points; ++q)
                   {
-                    const Point<dim> vertex = face_vals.quadrature_point(corner);
-                    const double elevation = sea_level_equation(vertex);
-                    if (write_to_file)
-                      output_file << vertex << ' '<< elevation << std::endl;
-                    if ( elevation > local_max_height)
-                      local_max_height = elevation;
-                    if ( elevation < local_min_height)
-                      local_min_height = elevation;
+                    const Point<3> current_position = fe_face_values.quadrature_point(q);
+                    const double nonuniform_sealevel_change = calculate_nonuniform_sealevel_change(current_position);
+                    nonuniform_sealevel_change_stored_values.emplace_back (current_position, std::make_pair(fe_face_values.JxW(q), nonuniform_sealevel_change));
                   }
               }
+          }
+      
+      std::vector<std::vector<double>> nonuniform_sealevel_change_spherical_function;
 
-      //Calculate min/max sea level across all processes
-      const double max_sealevel = Utilities::MPI::max(local_max_height, this->get_mpi_communicator());
-      const double min_sealevel = Utilities::MPI::min(local_min_height, this->get_mpi_communicator());
-
-      //Write results to statistics file
-      statistics.add_value ("Minimum sea level (m)",
-                            min_sealevel);
-      statistics.add_value ("Maximum sea level (m)",
-                            max_sealevel);
-      const char *columns[] = { "Minimum sealevel (m)",
-                                "Maximum sealevel (m)"
-                              };
-      for (unsigned int i=0; i<sizeof(columns)/sizeof(columns[0]); ++i)
+      for (unsigned int i=0; i<nonuniform_sealevel_change_stored_values.size(); ++i)
         {
-          statistics.set_precision (columns[i], 8);
-          statistics.set_scientific (columns[i], true);
+          const std::array<double,3> scoord = aspect::Utilities::Coordinates::cartesian_to_spherical_coordinates(nonuniform_sealevel_change_stored_values[i].first);
+
+          // Calculate spherical infinitesimal sin(theta)*d_theta*d_phi by infinitesimal_area/radius^2
+          const double infinitesimal = nonuniform_sealevel_change_stored_values[i].second.first/(outer_radius*outer_radius);
+
+          // Theta, phi, spherical infinitesimal, and non-uniform sea level change
+          nonuniform_sealevel_change_spherical_function.emplace_back(std::vector<double> {scoord[2],
+                                                                                          scoord[1],
+                                                                                          infinitesimal,
+                                                                                          nonuniform_sealevel_change_stored_values[i].second.second
+                                                                                         });
         }
 
-      output_stats.precision(4);
-      output_stats << min_sealevel << " m, "
-                   << max_sealevel << " m";
+      // New ocean height (nonuniform + offset).
+      relative_sealevel = nonuniform_sealevel_change_spherical_function
+      relative_sealevel[3] = relative_sealevel[3] + sealevel_offset      
+      
+      // Call ice loading.
+      iceload_spherical_function = sealevel_offset_and_iceload.second
 
-      // Write the solution to file
+      // // WRITING DATA: ADJUST
+      // // Get a quadrature rule that exists only on the corners
+      // QTrapezoid<dim-1> face_corners;
+      // FEFaceValues<dim> face_vals (this->get_mapping(), this->get_fe(), face_corners, update_quadrature_points);
 
-      // if this is the first time we get here, set the last output time
-      // to the current time - output_interval. this makes sure we
-      // always produce data during the first time step
-      if (std::isnan(last_output_time))
-        {
-          last_output_time = this->get_time() - output_interval;
-        }
+      // // Have a stream into which we write the data. the text stream is then later sent to processor 0.
+      // std::ostringstream output_stats;
+      // std::ostringstream output_file;
 
-      // Just return stats if text output is not required at all or not needed at this time
-      if (!write_to_file || ((this->get_time() < last_output_time + output_interval)
-                             && (this->get_timestep_number() != 0)))
-        return std::pair<std::string, std::string> ("Sea level min/max:",
-                                                    output_stats.str());
+      // // Choose stupidly large values for initialization
+      // double local_max_height = -std::numeric_limits<double>::max();
+      // double local_min_height = std::numeric_limits<double>::max();
 
-      std::string filename = this->get_output_directory() +
-                             "sealevel." +
-                             Utilities::int_to_string(this->get_timestep_number(), 5);
-      if (this->get_parameters().run_postprocessors_on_nonlinear_iterations)
-        filename.append("." + Utilities::int_to_string (this->get_nonlinear_iteration(), 4));
+      // // Loop over all of the surface cells and save the elevation to stored_value
+      // for (const auto &cell : this->get_dof_handler().active_cell_iterators())
+      //   if (cell->is_locally_owned() && cell->at_boundary())
+      //     for (unsigned int face_no = 0; face_no < GeometryInfo<dim>::faces_per_cell; ++face_no)
+      //       if (cell->face(face_no)->at_boundary())
+      //         {
+      //           if ( cell->face(face_no)->boundary_id() != relevant_boundary)
+      //             continue;
 
-      const unsigned int max_data_length = Utilities::MPI::max (output_file.str().size()+1,
-                                                                this->get_mpi_communicator());
+      //           face_vals.reinit( cell, face_no);
 
-      const unsigned int mpi_tag = 777;
+      //           for (unsigned int corner = 0; corner < face_corners.size(); ++corner)
+      //             {
+      //               const Point<dim> vertex = face_vals.quadrature_point(corner);
+      //               const double elevation = sea_level_equation(vertex);
+      //               if (write_to_file)
+      //                 output_file << vertex << ' '<< elevation << std::endl;
+      //               if ( elevation > local_max_height)
+      //                 local_max_height = elevation;
+      //               if ( elevation < local_min_height)
+      //                 local_min_height = elevation;
+      //             }
+      //         }
 
-      // on processor 0, collect all of the data the individual processors send
-      // and concatenate them into one file
-      if (Utilities::MPI::this_mpi_process(this->get_mpi_communicator()) == 0)
-        {
-          std::ofstream file (filename.c_str());
+      // //Calculate min/max sea level across all processes
+      // const double max_sealevel = Utilities::MPI::max(local_max_height, this->get_mpi_communicator());
+      // const double min_sealevel = Utilities::MPI::min(local_min_height, this->get_mpi_communicator());
 
-          file << "# "
-               << "x y z"
-               << " sealevel" << std::endl;
+      // //Write results to statistics file
+      // statistics.add_value ("Minimum sea level (m)",
+      //                       min_sealevel);
+      // statistics.add_value ("Maximum sea level (m)",
+      //                       max_sealevel);
+      // const char *columns[] = { "Minimum sealevel (m)",
+      //                           "Maximum sealevel (m)"
+      //                         };
+      // for (unsigned int i=0; i<sizeof(columns)/sizeof(columns[0]); ++i)
+      //   {
+      //     statistics.set_precision (columns[i], 8);
+      //     statistics.set_scientific (columns[i], true);
+      //   }
 
-          // first write out the data we have created locally
-          file << output_file.str();
+      // output_stats.precision(4);
+      // output_stats << min_sealevel << " m, "
+      //              << max_sealevel << " m";
 
-          std::string tmp;
-          tmp.resize (max_data_length, '\0');
+      // // Write the solution to file
 
-          // then loop through all of the other processors and collect
-          // data, then write it to the file
-          for (unsigned int p=1; p<Utilities::MPI::n_mpi_processes(this->get_mpi_communicator()); ++p)
-            {
-              MPI_Status status;
-              // get the data. note that MPI says that an MPI_Recv may receive
-              // less data than the length specified here. since we have already
-              // determined the maximal message length, we use this feature here
-              // rather than trying to find out the exact message length with
-              // a call to MPI_Probe.
-              const int ierr = MPI_Recv (&tmp[0], max_data_length, MPI_CHAR, p, mpi_tag,
-                                         this->get_mpi_communicator(), &status);
-              AssertThrowMPI(ierr);
+      // // if this is the first time we get here, set the last output time
+      // // to the current time - output_interval. this makes sure we
+      // // always produce data during the first time step
+      // if (std::isnan(last_output_time))
+      //   {
+      //     last_output_time = this->get_time() - output_interval;
+      //   }
 
-              // output the string. note that 'tmp' has length max_data_length,
-              // but we only wrote a certain piece of it in the MPI_Recv, ended
-              // by a \0 character. write only this part by outputting it as a
-              // C string object, rather than as a std::string
-              file << tmp.c_str();
-            }
-        }
-      else
-        // on other processors, send the data to processor zero. include the \0
-        // character at the end of the string
-        {
-          output_file << "\0";
-          const int ierr = MPI_Send (&output_file.str()[0], output_file.str().size()+1, MPI_CHAR, 0, mpi_tag,
-                                     this->get_mpi_communicator());
-          AssertThrowMPI(ierr);
-        }
+      // // Just return stats if text output is not required at all or not needed at this time
+      // if (!write_to_file || ((this->get_time() < last_output_time + output_interval)
+      //                        && (this->get_timestep_number() != 0)))
+      //   return std::pair<std::string, std::string> ("Sea level min/max:",
+      //                                               output_stats.str());
 
-      // if output_interval is positive, then update the last supposed output
-      // time
-      if (output_interval > 0)
-        {
-          // We need to find the last time output was supposed to be written.
-          // this is the last_output_time plus the largest positive multiple
-          // of output_intervals that passed since then. We need to handle the
-          // edge case where last_output_time+output_interval==current_time,
-          // we did an output and std::floor sadly rounds to zero. This is done
-          // by forcing std::floor to round 1.0-eps to 1.0.
-          const double magic = 1.0+2.0*std::numeric_limits<double>::epsilon();
-          last_output_time = last_output_time + std::floor((this->get_time()-last_output_time)/output_interval*magic) * output_interval/magic;
-        }
+      // std::string filename = this->get_output_directory() +
+      //                        "sealevel." +
+      //                        Utilities::int_to_string(this->get_timestep_number(), 5);
+      // if (this->get_parameters().run_postprocessors_on_nonlinear_iterations)
+      //   filename.append("." + Utilities::int_to_string (this->get_nonlinear_iteration(), 4));
 
-      return std::pair<std::string, std::string> ("Sea level min/max:",
-                                                  output_stats.str());
+      // const unsigned int max_data_length = Utilities::MPI::max (output_file.str().size()+1,
+      //                                                           this->get_mpi_communicator());
+
+      // const unsigned int mpi_tag = 777;
+
+      // // on processor 0, collect all of the data the individual processors send
+      // // and concatenate them into one file
+      // if (Utilities::MPI::this_mpi_process(this->get_mpi_communicator()) == 0)
+      //   {
+      //     std::ofstream file (filename.c_str());
+
+      //     file << "# "
+      //          << "x y z"
+      //          << " sealevel" << std::endl;
+
+      //     // first write out the data we have created locally
+      //     file << output_file.str();
+
+      //     std::string tmp;
+      //     tmp.resize (max_data_length, '\0');
+
+      //     // then loop through all of the other processors and collect
+      //     // data, then write it to the file
+      //     for (unsigned int p=1; p<Utilities::MPI::n_mpi_processes(this->get_mpi_communicator()); ++p)
+      //       {
+      //         MPI_Status status;
+      //         // get the data. note that MPI says that an MPI_Recv may receive
+      //         // less data than the length specified here. since we have already
+      //         // determined the maximal message length, we use this feature here
+      //         // rather than trying to find out the exact message length with
+      //         // a call to MPI_Probe.
+      //         const int ierr = MPI_Recv (&tmp[0], max_data_length, MPI_CHAR, p, mpi_tag,
+      //                                    this->get_mpi_communicator(), &status);
+      //         AssertThrowMPI(ierr);
+
+      //         // output the string. note that 'tmp' has length max_data_length,
+      //         // but we only wrote a certain piece of it in the MPI_Recv, ended
+      //         // by a \0 character. write only this part by outputting it as a
+      //         // C string object, rather than as a std::string
+      //         file << tmp.c_str();
+      //       }
+      //   }
+      // else
+      //   // on other processors, send the data to processor zero. include the \0
+      //   // character at the end of the string
+      //   {
+      //     output_file << "\0";
+      //     const int ierr = MPI_Send (&output_file.str()[0], output_file.str().size()+1, MPI_CHAR, 0, mpi_tag,
+      //                                this->get_mpi_communicator());
+      //     AssertThrowMPI(ierr);
+      //   }
+
+      // // if output_interval is positive, then update the last supposed output
+      // // time
+      // if (output_interval > 0)
+      //   {
+      //     // We need to find the last time output was supposed to be written.
+      //     // this is the last_output_time plus the largest positive multiple
+      //     // of output_intervals that passed since then. We need to handle the
+      //     // edge case where last_output_time+output_interval==current_time,
+      //     // we did an output and std::floor sadly rounds to zero. This is done
+      //     // by forcing std::floor to round 1.0-eps to 1.0.
+      //     const double magic = 1.0+2.0*std::numeric_limits<double>::epsilon();
+      //     last_output_time = last_output_time + std::floor((this->get_time()-last_output_time)/output_interval*magic) * output_interval/magic;
+      //   }
+
+      // return std::pair<std::string, std::string> ("Sea level min/max:",
+      //                                             output_stats.str());
     }
 
 
@@ -366,6 +466,29 @@ namespace aspect
 
 
     template <int dim>
+    double
+    Sealevel<dim>::evaluate (const Point<dim> &/*position*/) const
+    {
+      Assert(false, ExcNotImplemented());
+      return 0;
+    }
+
+    template <>
+    double
+    Sealevel<3>::evaluate (const Point<3> &position) const
+    {
+      const std::array<double,3> scoord = aspect::Utilities::Coordinates::cartesian_to_spherical_coordinates(p);
+      const double theta = scoord[2];
+      const double phi = scoord[1];
+      double RSL = 0; // how to retrieve this from variable 'relative_sealevel'?
+      double ice_height = 0; // how to retrieve this from variable 'iceload_spherical_function'?
+      std::pair<double, double> RSL_and_ice_height = std::make_pair(RSL,ice_height)
+
+      return RSL_and_ice_height;
+    }
+
+
+    template <int dim>
     void
     SeaLevel<dim>::declare_parameters (ParameterHandler &prm)
     {
@@ -373,11 +496,51 @@ namespace aspect
       {
         prm.enter_subsection("Sea level");
         {
+          prm.declare_entry ("Ice density", "931",
+                              Patterns::Anything (),
+                             "The density of ice [kg/m3]");
+          prm.declare_entry ("Water density", "1000",
+                              Patterns::Anything (),
+                             "The density of water [kg/m3]");
+
+          prm.declare_entry ("Data directory topography",
+                             "$ASPECT_SOURCE_DIR/data/geometry-model/initial-topography-model/ascii-data/test/",
+                             Patterns::DirectoryName (),
+                             "The name of a directory that contains the topography "
+                             "ascii data. This path may either be absolute (if starting with a "
+                             "`/') or relative to the current directory. The path may also "
+                             "include the special text `$ASPECT_SOURCE_DIR' which will be "
+                             "interpreted as the path in which the ASPECT source files were "
+                             "located when ASPECT was compiled. This interpretation allows, "
+                             "for example, to reference files located in the `data/' subdirectory "
+                             "of ASPECT.");
+          prm.declare_entry ("Data file name topography", "shell_3d_outer.0.txt",
+                             Patterns::Anything (),
+                             "The file name of the topography ascii data. For the ascii data, "
+                             "provide file in the same format as described in "
+                             "'ascii data' initial composition plugin." );
+
+          prm.declare_entry ("Data directory ice load",
+                             "$ASPECT_SOURCE_DIR/data/boundary_traction/ascii-data/test/",
+                             Patterns::DirectoryName (),
+                             "The name of a directory that contains the ice load "
+                             "ascii data. This path may either be absolute (if starting with a "
+                             "`/') or relative to the current directory. The path may also "
+                             "include the special text `$ASPECT_SOURCE_DIR' which will be "
+                             "interpreted as the path in which the ASPECT source files were "
+                             "located when ASPECT was compiled. This interpretation allows, "
+                             "for example, to reference files located in the `data/' subdirectory "
+                             "of ASPECT.");
+          prm.declare_entry ("Data file name ice load", "shell_3d_outer.0.txt",
+                             Patterns::Anything (),
+                             "The file name of the ice load ascii data. For the ascii data, "
+                             "provide file in the same format as described in "
+                             "'ascii data' initial composition plugin." );
+
           prm.declare_entry ("Output to file", "false",
                              Patterns::List(Patterns::Bool()),
                              "Whether or not to write sea level to a text file named named "
                              "'sealevel.NNNNN' in the output directory");
-
           prm.declare_entry ("Time between text output", "0.",
                              Patterns::Double (0.),
                              "The time interval between each generation of "
@@ -401,6 +564,12 @@ namespace aspect
       {
         prm.enter_subsection("Sea level");
         {
+          density_ice = prm.get ("Ice density");
+          density_water = prm.get ("Water density");
+          data_directory_topography = Utilities::expand_ASPECT_SOURCE_DIR(prm.get ("Data directory topography"));
+          data_file_name_topography = prm.get ("Data file name topography");
+          data_directory_iceload = Utilities::expand_ASPECT_SOURCE_DIR(prm.get ("Data directory ide load"));
+          data_file_name_iceload = prm.get ("Data file name ice load");
           write_to_file = prm.get_bool ("Output to file");
           output_interval = prm.get_double ("Time between text output");
           if (this->convert_output_to_years())
@@ -410,10 +579,6 @@ namespace aspect
       }
       prm.leave_subsection();
     }
-
-
-
-
   }
 }
 
