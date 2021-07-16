@@ -35,8 +35,9 @@
 #include <limits>
 
 // TODO:
-// Obtain geoid anomaly of surface load
+// Include geoid anomaly of surface load
 // Compute new surface gravity per location, dependent on surface topography and Earth model
+// Time-changing ocean geometry
 
 namespace aspect
 {
@@ -46,20 +47,37 @@ namespace aspect
     void
     SeaLevel<dim>::initialize()
     {
-      topography_lookup = std::make_unique<Utilities::StructuredDataLookup<dim-1>>(1,1.0);
+      Assert(false, ExcNotImplemented());
+    }
+
+    template <>
+    void
+    SeaLevel<3>::initialize()
+    {
+      const int dim = 3;
+
+      topography_lookup = std::make_unique<Utilities::StructuredDataLookup<dim-1> >(1,1.0);
       topography_lookup->load_file(data_directory_topography+data_file_name_topography,this->get_mpi_communicator());
 
-      iceheight_lookup = std::make_unique<Utilities::StructuredDataLookup<dim-1>>(1,1.0);
+      iceheight_lookup = std::make_unique<Utilities::StructuredDataLookup<dim-1> >(1,1.0);
       iceheight_lookup->load_file(data_directory_iceheight+data_file_name_iceheight,this->get_mpi_communicator());
     }
 
-
     template <int dim>
     double
-    SeaLevel<dim>::compute_nonuniform_sealevel_change(const Point<dim> &position) const
+    SeaLevel<dim>::compute_nonuniform_sealevel_change(const Point<dim> &/*position*/) const
     {
-      const Postprocess::Geoid<3> &geoid =
-        this->get_postprocess_manager().template get_matching_postprocessor<Postprocess::Geoid<3>>();
+      Assert(false, ExcNotImplemented());
+    }
+
+    template <>
+    double
+    SeaLevel<3>::compute_nonuniform_sealevel_change(const Point<3> &position) const
+    {
+      const int dim = 3;
+
+      const Postprocess::Geoid<dim> &geoid =
+        this->get_postprocess_manager().template get_matching_postprocessor<Postprocess::Geoid<dim>>();
 
       const double geoid_displacement = geoid.evaluate(position); // (check sign of geoid_displacement)  
       const double topography = this->get_geometry_model().height_above_reference_surface(position);
@@ -70,49 +88,64 @@ namespace aspect
         internal_position[d-1] = spherical_position[d];
 
       const double topography_init = topography_lookup->get_data(internal_position,0);
+      int ocean_mask = 0;
       if (topography_init > 0.0)
-        const double ocean_mask = 1;
+        ocean_mask = 1;
       else
-        const double ocean_mask = 0;
+        ocean_mask = 0;
       
       const double nonuniform_sealevel_change = (geoid_displacement-topography)*ocean_mask;
 
       return nonuniform_sealevel_change;
     }
 
-
     template <int dim>
     double
-    SeaLevel<dim>::compute_sealevel_offset(const double &outer_radius) const
+    SeaLevel<dim>::compute_sealevel_offset(const double &/*outer_radius*/) const
     {
-      const unsigned int quadrature_degree = this->introspection().polynomial_degree.temperature;
-      const QGauss<2> quadrature_formula_face(quadrature_degree);
+      Assert(false, ExcNotImplemented());
+    }
 
-      FEFaceValues<3> fe_face_values (this->get_mapping(),
-                                      this->get_fe(),
-                                      quadrature_formula_face,
-                                      update_values |
-                                      update_quadrature_points |
-                                      update_JxW_values);
+    template <>
+    double
+    SeaLevel<3>::compute_sealevel_offset(const double &outer_radius) const
+    {
+      const int dim = 3;
+
+      const unsigned int quadrature_degree = this->introspection().polynomial_degree.temperature;
+      const QGauss<dim-1> quadrature_formula_face(quadrature_degree);
+
+      FEFaceValues<dim> fe_face_values (this->get_mapping(),
+                                        this->get_fe(),
+                                        quadrature_formula_face,
+                                        update_values |
+                                        update_quadrature_points |
+                                        update_JxW_values);
 
 
       // Vectors to store the location, infinitesimal area, and topography/geoid displacement/ocean mask/ice height associated with each quadrature point of each surface cell.
-      std::vector<std::pair<Point<3>,std::pair<double,double>>> topo_stored_values;
-      std::vector<std::pair<Point<3>,std::pair<double,double>>> geoid_stored_values;
-      std::vector<std::pair<Point<3>,std::pair<double,double>>> oceanmask_stored_values;
-      std::vector<std::pair<Point<3>,std::pair<double,double>>> iceheight_stored_values;
+      std::vector<std::pair<Point<dim>,std::pair<double,double>>> topo_stored_values;
+      std::vector<std::pair<Point<dim>,std::pair<double,double>>> geoid_stored_values;
+      std::vector<std::pair<Point<dim>,std::pair<double,double>>> oceanmask_stored_values;
+      std::vector<std::pair<Point<dim>,std::pair<double,double>>> iceheight_stored_values;
+
+      double integral_oceanmask = 0;
+      double integral_iceheight = 0;
+      double integral_topo_geoid = 0;
 
       // Loop over all of the boundary cells and if one is at the
       // surface, evaluate the topography/geoid displacement/ocean mask/ice height there.
       for (const auto &cell : this->get_dof_handler().active_cell_iterators())
         if (cell->is_locally_owned() && cell->at_boundary())
           {
+            unsigned int face_idx = numbers::invalid_unsigned_int;
             bool at_upper_surface = false;
             {
-              for (unsigned int f=0; f<GeometryInfo<3>::faces_per_cell; ++f)
+              for (unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell; ++f)
                 {
                   if (cell->at_boundary(f) && cell->face(f)->boundary_id() == this->get_geometry_model().translate_symbolic_boundary_name_to_id("top"))
                     {
+                      face_idx = f;
                       at_upper_surface = true;
                       break;
                     }
@@ -126,17 +159,20 @@ namespace aspect
             }
 
             // Focus on the boundary cell's upper face if on the top boundary.
-            fe_face_values.reinit(cell);
+            fe_face_values.reinit(cell,face_idx);
 
             // If the cell is at the top boundary, add its contributions to the topography/geoid displacement/ocean mask/ice height storage vectors.
             if (at_upper_surface)
               {
                 for (unsigned int q=0; q<fe_face_values.n_quadrature_points; ++q)
                   {
-                    const Point<3> current_position = fe_face_values.quadrature_point(q);
+                    const Point<dim> current_position = fe_face_values.quadrature_point(q);
                     const double topography = this->get_geometry_model().height_above_reference_surface(current_position);
                     topo_stored_values.emplace_back (current_position, std::make_pair(fe_face_values.JxW(q), topography));
-                    const double geoid_displacement = Geoid<dim>::evaluate(current_position);
+
+                    const Postprocess::Geoid<dim> &geoid =
+                      this->get_postprocess_manager().template get_matching_postprocessor<Postprocess::Geoid<dim>>();
+                    const double geoid_displacement = geoid.evaluate(current_position);
                     geoid_stored_values.emplace_back (fe_face_values.quadrature_point(q), std::make_pair(fe_face_values.JxW(q), geoid_displacement));
 
                     Point<dim-1> internal_position;
@@ -145,20 +181,17 @@ namespace aspect
                       internal_position[d-1] = spherical_position[d];
 
                     const double topography_init = topography_lookup->get_data(internal_position,0);
+                    int ocean_mask = 0;
                     if (topography_init > 0.0)
-                      const double ocean_mask = 1;
+                      ocean_mask = 1;
                     else
-                      const double ocean_mask = 0;
+                      ocean_mask = 0;
                     oceanmask_stored_values.emplace_back (fe_face_values.quadrature_point(q), std::make_pair(fe_face_values.JxW(q), ocean_mask));
 
                     const double ice_height = iceheight_lookup->get_data(internal_position,0);
                     iceheight_stored_values.emplace_back (fe_face_values.quadrature_point(q), std::make_pair(fe_face_values.JxW(q), ice_height));
                     
                     // Compute required integrals for the sea level offset.
-                    double integral_oceanmask = 0;
-                    double integral_iceheight = 0;
-                    double integral_topo_geoid = 0;
-
                     integral_oceanmask += ocean_mask*fe_face_values.JxW(q);
                     integral_iceheight += ice_height*density_ice*(1-ocean_mask)*fe_face_values.JxW(q);
                     integral_topo_geoid += (geoid_displacement-topography)*ocean_mask*fe_face_values.JxW(q);
@@ -212,12 +245,20 @@ namespace aspect
       return sealevel_offset;
     }
 
-
     template <int dim>
     double
-    SeaLevel<dim>::compute_total_surface_pressure(const Point<dim> &position) const
+    SeaLevel<dim>::compute_total_surface_pressure(const Point<dim> &/*position*/) const
     {
-      nonuniform_sealevel_change = compute_nonuniform_sealevel_change(position);
+      Assert(false, ExcNotImplemented());
+    }
+
+    template <>
+    double
+    SeaLevel<3>::compute_total_surface_pressure(const Point<3> &position) const
+    {
+      const int dim = 3;
+
+      const double nonuniform_sealevel_change = compute_nonuniform_sealevel_change(position);
       
       Point<dim-1> internal_position;
       const std::array<double,dim> spherical_position = aspect::Utilities::Coordinates::cartesian_to_spherical_coordinates(position);
@@ -225,6 +266,10 @@ namespace aspect
         internal_position[d-1] = spherical_position[d];
       const double ice_height = iceheight_lookup->get_data(internal_position,0);
 
+      const GeometryModel::SphericalShell<dim> &geometry_model = Plugins::get_plugin_as_type<const GeometryModel::SphericalShell<dim>> (this->get_geometry_model());
+      
+      // instead of outer_radius use free surface topography, so different per point.
+      const double outer_radius = geometry_model.outer_radius();
       Point<dim> surface_point;
       surface_point[0] = outer_radius;
       const double surface_gravity = this->get_gravity_model().gravity_vector(surface_point).norm();
@@ -234,16 +279,22 @@ namespace aspect
       return total_surface_pressure;
     }
 
-
     template <int dim>
     std::pair<std::string,std::string>
-    SeaLevel<dim>::execute (TableHandler &statistics)
+    SeaLevel<dim>::execute (TableHandler &/*statistics*/)
     {
+      Assert(false, ExcNotImplemented());
+    }
+
+    template <>
+    std::pair<std::string,std::string>
+    SeaLevel<3>::execute (TableHandler &statistics)
+    {
+      const int dim = 3;
+
       // Disallow use of the plugin for any other than a 3D spherical shell geometry.
-      AssertThrow (Plugins::plugin_type_matches<const GeometryModel::SphericalShell<dim>>(this->get_geometry_model())
-                   &&
-                   dim == 3,
-                   ExcMessage("The sea level postprocessor is currently only implemented for the 3D spherical shell geometry model."));
+      AssertThrow (Plugins::plugin_type_matches<const GeometryModel::SphericalShell<dim>>(this->get_geometry_model()) && dim == 3,
+                   ExcMessage("The geoid postprocessor is currently only implemented for the 3D spherical shell geometry model."));
 
       const GeometryModel::SphericalShell<dim> &geometry_model = Plugins::get_plugin_as_type<const GeometryModel::SphericalShell<dim>> (this->get_geometry_model());
       const types::boundary_id relevant_boundary = this->get_geometry_model().translate_symbolic_boundary_name_to_id ("top");
@@ -251,8 +302,8 @@ namespace aspect
       // Get the value of the outer radius.
       const double outer_radius = geometry_model.outer_radius();
 
-//      const Postprocess::Geoid<3> &geoid =
-//        this->get_postprocess_manager().template get_matching_postprocessor<Postprocess::Geoid<3>>();
+//      const Postprocess::Geoid<dim> &geoid =
+//        this->get_postprocess_manager().template get_matching_postprocessor<Postprocess::Geoid<dim>>();
       
       // Get the sea level offset (constant for every location).
       sealevel_offset = compute_sealevel_offset(outer_radius);
@@ -427,10 +478,10 @@ namespace aspect
         prm.enter_subsection("Sea level");
         {
           prm.declare_entry ("Ice density", "931",
-                              Patterns::Double (0.),
+                              Patterns::Double(0., 1.),
                              "The density of ice [kg/m3]");
           prm.declare_entry ("Water density", "1000",
-                              Patterns::Double (0.),
+                              Patterns::Double(0., 1.),
                              "The density of water [kg/m3]");
 
           prm.declare_entry ("Data directory topography",
@@ -494,8 +545,8 @@ namespace aspect
       {
         prm.enter_subsection("Sea level");
         {
-          density_ice = prm.get ("Ice density");
-          density_water = prm.get ("Water density");
+          density_ice = prm.get_double ("Ice density");
+          density_water = prm.get_double ("Water density");
           data_directory_topography = Utilities::expand_ASPECT_SOURCE_DIR(prm.get ("Data directory topography"));
           data_file_name_topography = prm.get ("Data file name topography");
           data_directory_iceheight = Utilities::expand_ASPECT_SOURCE_DIR(prm.get ("Data directory ide load"));
@@ -538,7 +589,7 @@ namespace aspect
       // const unsigned int quadrature_degree = this->introspection().polynomial_degree.temperature;
       // const QGauss<2> quadrature_formula_face(quadrature_degree);
 
-      // FEFaceValues<3> fe_face_values (this->get_mapping(),
+      // FEFaceValues<dim> fe_face_values (this->get_mapping(),
       //                                 this->get_fe(),
       //                                 quadrature_formula_face,
       //                                 update_values |
@@ -546,7 +597,7 @@ namespace aspect
       //                                 update_JxW_values);
 
       // // Vectors to store the location, infinitesimal area, and non-uniform sea level change associated with each quadrature point of each surface cell.
-      // std::vector<std::pair<Point<3>,std::pair<double,double>>> nonuniform_sealevel_change_stored_values;
+      // std::vector<std::pair<Point<dim>,std::pair<double,double>>> nonuniform_sealevel_change_stored_values;
 
       // // Loop over all of the boundary cells and if one is at the
       // // surface, evaluate the non-uniform sea level change there.
@@ -555,7 +606,7 @@ namespace aspect
       //     {
       //       bool at_upper_surface = false;
       //       {
-      //         for (unsigned int f=0; f<GeometryInfo<3>::faces_per_cell; ++f)
+      //         for (unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell; ++f)
       //           {
       //             if (cell->at_boundary(f) && cell->face(f)->boundary_id() == this->get_geometry_model().translate_symbolic_boundary_name_to_id("top"))
       //               {
@@ -579,7 +630,7 @@ namespace aspect
       //         {
       //           for (unsigned int q=0; q<fe_face_values.n_quadrature_points; ++q)
       //             {
-      //               const Point<3> current_position = fe_face_values.quadrature_point(q);
+      //               const Point<dim> current_position = fe_face_values.quadrature_point(q);
       //               const double nonuniform_sealevel_change = compute_nonuniform_sealevel_change(current_position);
       //               nonuniform_sealevel_change_stored_values.emplace_back (current_position, std::make_pair(fe_face_values.JxW(q), nonuniform_sealevel_change));
       //             }

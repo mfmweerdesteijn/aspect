@@ -80,6 +80,18 @@ namespace aspect
 
       private:
         /**
+         * Function to determine non-uniform sea level change for any given location.
+         */
+        double
+        compute_nonuniform_sealevel_change(const Point<dim> &position) const;
+        
+        /**
+         * Function to determine the sea level offset.
+         */
+        double
+        compute_sealevel_offset(const double &outer_radius) const;
+
+        /**
          * Information about the location of topography data files.
          */
         std::string data_directory_topography;
@@ -92,19 +104,10 @@ namespace aspect
         std::string data_file_name_iceheight;
 
         /**
-         * Pointer to the StructuredDataLookup object that holds the topography data.
+         * Pointer to the StructuredDataLookup object that holds the topography  and ice height data.
          */
         std::unique_ptr<Utilities::StructuredDataLookup<2>> topography_lookup;
-
-        /**
-         * description
-         */
-        topography_lookup
-
-        /**
-         * description
-         */
-        iceheight_lookup
+        std::unique_ptr<Utilities::StructuredDataLookup<2>> iceheight_lookup;
 
         /**
          * description
@@ -115,58 +118,6 @@ namespace aspect
          * description
          */
         double density_ice;
-
-        /**
-         * description
-         */
-        //const double outer_radius;
-
-        /**
-         * description
-         */
-        //const double nonuniform_sealevel_change;
-
-        /**
-         * description
-         */
-        //const double topography_init;
-
-        /**
-         * description
-         */
-        //const double ocean_mask;
-
-        /**
-         * description
-         */
-        //double integral_oceanmask;
-
-        /**
-         * description
-         */
-        //double integral_iceheight;
-
-        /**
-         * description
-         */
-        //double integral_topo_geoid;
-
-        /**
-         * Pointer to the StructuredDataLookup object that holds the ice height data.
-         */
-        std::unique_ptr<Utilities::StructuredDataLookup<2>> iceheight_lookup;
-
-        /**
-         * Function to determine non-uniform sea level change for any given location.
-         */
-        double
-        compute_nonuniform_sealevel_change(const Point<dim> &position) const;
-        
-        /**
-         * Function to determine the sea level offset.
-         */
-        double
-        compute_sealevel_offset(const double &outer_radius) const;
 
         /**
          * The sealevel offset.
