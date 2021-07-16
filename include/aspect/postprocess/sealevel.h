@@ -41,9 +41,22 @@ namespace aspect
     {
       public:
         /**
-         * Output sea level [m] to file
+         * Sets up structured data lookup for topography and ice height input data.
          */
-        std::pair<std::string,std::string> execute (TableHandler &statistics) override;
+        void initialize() override;
+
+        /**
+         * Output non-uniform sea level change [m] to file.
+         */
+        std::pair<std::string,std::string> 
+        execute (TableHandler &statistics) override;
+
+        /**
+         * Evaluate the total surface pressure from ice and water loading at 
+         * a point.
+         */
+        double
+        compute_total_surface_pressure(const Point<dim> &) const;
 
         /**
          * Register with the simulator the other postprocessors that we need
@@ -52,10 +65,6 @@ namespace aspect
         std::list<std::string>
         required_other_postprocessors() const override;
 
-        /**
-         * @name Functions used in dealing with run-time parameters
-         * @{
-         */
         /**
          * Declare the parameters this class takes through input files.
          */
@@ -68,19 +77,104 @@ namespace aspect
          */
         void
         parse_parameters (ParameterHandler &prm) override;
-        /**
-         * @}
-         */
 
       private:
         /**
-         * Function to determine sea level for any given location
+         * Information about the location of topography data files.
          */
-        double
-        sea_level_equation(const Point<dim> &position);
+        std::string data_directory_topography;
+        std::string data_file_name_topography;
 
         /**
-         * Whether or not to produce text files with sea level values
+         * Information about the location of ice height data files.
+         */        
+        std::string data_directory_iceheight;
+        std::string data_file_name_iceheight;
+
+        /**
+         * Pointer to the StructuredDataLookup object that holds the topography data.
+         */
+        std::unique_ptr<Utilities::StructuredDataLookup<2>> topography_lookup;
+
+        /**
+         * description
+         */
+        topography_lookup
+
+        /**
+         * description
+         */
+        iceheight_lookup
+
+        /**
+         * description
+         */
+        double density_water;
+
+        /**
+         * description
+         */
+        double density_ice;
+
+        /**
+         * description
+         */
+        //const double outer_radius;
+
+        /**
+         * description
+         */
+        //const double nonuniform_sealevel_change;
+
+        /**
+         * description
+         */
+        //const double topography_init;
+
+        /**
+         * description
+         */
+        //const double ocean_mask;
+
+        /**
+         * description
+         */
+        //double integral_oceanmask;
+
+        /**
+         * description
+         */
+        //double integral_iceheight;
+
+        /**
+         * description
+         */
+        //double integral_topo_geoid;
+
+        /**
+         * Pointer to the StructuredDataLookup object that holds the ice height data.
+         */
+        std::unique_ptr<Utilities::StructuredDataLookup<2>> iceheight_lookup;
+
+        /**
+         * Function to determine non-uniform sea level change for any given location.
+         */
+        double
+        compute_nonuniform_sealevel_change(const Point<dim> &position) const;
+        
+        /**
+         * Function to determine the sea level offset.
+         */
+        double
+        compute_sealevel_offset(const double &outer_radius) const;
+
+        /**
+         * The sealevel offset.
+         */
+        double sealevel_offset;
+
+        /**
+         * Whether or not to produce text files with sea level values.
          */
         bool write_to_file;
 
